@@ -225,6 +225,64 @@ class TestJudgeGoal:
         assert reason == "not yet"
 
 
+class TestGoalJudgeTimeout:
+    """The judge API timeout must be configurable via auxiliary.goal_judge.timeout.
+
+    A local vLLM judge endpoint can be asleep (long image/video generation on
+    the same GPU) and only respond again once generation finishes. The default
+    30 s deadline fires APITimeoutError before such an endpoint wakes, so the
+    knob must actually take effect on the judge call. These tests prove the
+    config value flows through to client.chat.completions.create(timeout=...)
+    and that a missing config falls back to the default.
+    """
+
+    def test_config_timeout_flows_to_create_call(self, hermes_home):
+        from hermes_cli import goals
+
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = MagicMock(
+            choices=[
+                MagicMock(message=MagicMock(content='{"done": false, "reason": "wip"}'))
+            ]
+        )
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ), patch("hermes_cli.config.load_config") as load_cfg:
+            load_cfg.return_value = {"auxiliary": {"goal_judge": {"timeout": 600}}}
+            goals.judge_goal("goal", "response")
+
+        _, kwargs = fake_client.chat.completions.create.call_args
+        assert kwargs["timeout"] == 600
+
+    def test_missing_config_falls_back_to_default(self, hermes_home):
+        from hermes_cli.goals import DEFAULT_JUDGE_TIMEOUT, _goal_judge_timeout
+
+        with patch("hermes_cli.config.load_config") as load_cfg:
+            load_cfg.return_value = {}
+            assert _goal_judge_timeout() == DEFAULT_JUDGE_TIMEOUT
+
+    def test_explicit_timeout_overrides_config(self, hermes_home):
+        """A caller-supplied timeout wins over the config value (per-call override)."""
+        from hermes_cli import goals
+
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = MagicMock(
+            choices=[
+                MagicMock(message=MagicMock(content='{"done": false, "reason": "wip"}'))
+            ]
+        )
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ), patch("hermes_cli.config.load_config") as load_cfg:
+            load_cfg.return_value = {"auxiliary": {"goal_judge": {"timeout": 600}}}
+            goals.judge_goal("goal", "response", timeout=5)
+
+        _, kwargs = fake_client.chat.completions.create.call_args
+        assert kwargs["timeout"] == 5
+
+
 # ──────────────────────────────────────────────────────────────────────
 # GoalManager lifecycle + persistence
 # ──────────────────────────────────────────────────────────────────────

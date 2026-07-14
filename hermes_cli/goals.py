@@ -45,6 +45,12 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────
 
 DEFAULT_MAX_TURNS = 20
+# Fallback when ``auxiliary.goal_judge.timeout`` is unset. Override that
+# config key to extend the deadline for a slow judge endpoint — e.g. a local
+# vLLM server that sleeps while the agent generates images/videos and only
+# responds again once generation finishes. The default 30 s fires
+# APITimeoutError before such an endpoint wakes, which fail-opens to
+# ``continue`` (silently skipping the verdict for that turn).
 DEFAULT_JUDGE_TIMEOUT = 30.0
 # Judge output budget. The freeform judge returns a one-line JSON verdict, but
 # reasoning models (deepseek-v4, qwq, etc.) burn tokens on hidden reasoning
@@ -690,6 +696,32 @@ def _goal_judge_max_tokens() -> int:
     return DEFAULT_JUDGE_MAX_TOKENS
 
 
+def _goal_judge_timeout() -> float:
+    """Resolve ``auxiliary.goal_judge.timeout``, falling back to the default.
+
+    Mirrors :func:`_goal_judge_max_tokens`: ``load_config()`` is cached on the
+    config file's (mtime, size), so calling this once per judge turn is cheap.
+    A non-positive value falls back to the default rather than wedging the
+    goal loop with an effectively-infinite wait. See ``DEFAULT_JUDGE_TIMEOUT``
+    for why a longer deadline may be required.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        value = (
+            (cfg.get("auxiliary") or {})
+            .get("goal_judge", {})
+            .get("timeout", DEFAULT_JUDGE_TIMEOUT)
+        )
+        value = float(value)
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return DEFAULT_JUDGE_TIMEOUT
+
+
 def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, Any]]]:
     """Parse the judge's reply. Fail-open on unusable output.
 
@@ -837,7 +869,7 @@ def judge_goal(
     goal: str,
     last_response: str,
     *,
-    timeout: float = DEFAULT_JUDGE_TIMEOUT,
+    timeout: Optional[float] = None,
     subgoals: Optional[List[str]] = None,
     background_processes: Optional[List[Dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
@@ -870,6 +902,10 @@ def judge_goal(
     This is deliberately fail-open: any error returns ``("continue", ..., False, None)``
     so a broken judge doesn't wedge progress — the turn budget and the
     consecutive-parse-failures auto-pause are the backstops.
+
+    ``timeout`` defaults to ``auxiliary.goal_judge.timeout`` from config
+    (falling back to :data:`DEFAULT_JUDGE_TIMEOUT`); pass an explicit value to
+    override it per call.
     """
     if not goal.strip():
         return "skipped", "empty goal", False, None
@@ -891,6 +927,9 @@ def judge_goal(
 
     if client is None or not model:
         return "continue", "no auxiliary client configured", False, None
+
+    if timeout is None:
+        timeout = _goal_judge_timeout()
 
     # Build the prompt. Priority: contract > subgoals > plain. When both a
     # contract and subgoals exist, the subgoals are appended into the
@@ -984,7 +1023,7 @@ def gather_background_processes(task_id: Optional[str] = None) -> List[Dict[str,
     return [s for s in sessions if isinstance(s, dict) and s.get("status") != "exited"]
 
 
-def draft_contract(objective: str, *, timeout: float = DEFAULT_JUDGE_TIMEOUT) -> Optional[GoalContract]:
+def draft_contract(objective: str, *, timeout: Optional[float] = None) -> Optional[GoalContract]:
     """Expand a plain-language objective into a structured completion contract.
 
     Uses the ``goal_judge`` auxiliary task (main-model-first, cache-safe — it
@@ -993,6 +1032,9 @@ def draft_contract(objective: str, *, timeout: float = DEFAULT_JUDGE_TIMEOUT) ->
     unavailable or the model's reply can't be parsed. Callers fall back to a
     bare free-form goal in that case, so a missing/weak aux model never blocks
     setting a goal.
+
+    ``timeout`` defaults to ``auxiliary.goal_judge.timeout`` from config
+    (falling back to :data:`DEFAULT_JUDGE_TIMEOUT`).
     """
     objective = (objective or "").strip()
     if not objective:
@@ -1012,6 +1054,9 @@ def draft_contract(objective: str, *, timeout: float = DEFAULT_JUDGE_TIMEOUT) ->
 
     if client is None or not model:
         return None
+
+    if timeout is None:
+        timeout = _goal_judge_timeout()
 
     try:
         resp = client.chat.completions.create(
