@@ -54,6 +54,13 @@ class FailoverReason(enum.Enum):
 
     # Model / provider policy
     model_not_found = "model_not_found"  # 404 or invalid model — fallback to different model
+    # llama.cpp / local inference server with lazy model loading (e.g.
+    # ``--no-model-autoload``) returns HTTP 400 "model is not loaded" while
+    # the requested model is being loaded into memory. The model exists and
+    # WILL become available — the correct recovery is to wait (retry with
+    # backoff), not to abort as a non-retryable client error or fall back to
+    # a different model.
+    model_not_loaded = "model_not_loaded"
     provider_policy_blocked = "provider_policy_blocked"  # Aggregator (e.g. OpenRouter) blocked the only endpoint due to account data/privacy policy
     content_policy_blocked = "content_policy_blocked"  # Provider safety filter rejected this prompt — deterministic per-request, don't retry unchanged
 
@@ -361,6 +368,15 @@ _INVALID_MESSAGE_BODY_PATTERNS = [
     "text content blocks must be non-empty",
     "content field is required",
     "messages: at least one message is required",
+]
+
+# llama.cpp / local inference server "model is not loaded" patterns.
+# Emitted (as HTTP 400, ``type: invalid_request_error``) when the server runs
+# with ``--no-model-autoload`` and the requested model isn't resident yet —
+# it's mid-load, not missing. Retryable: wait for the load to finish rather
+# than aborting or switching models.
+_MODEL_NOT_LOADED_PATTERNS = [
+    "model is not loaded",
 ]
 
 # Request-validation patterns — the request is malformed and will fail
@@ -1351,6 +1367,23 @@ def _classify_400(
             should_compress=False,
         )
 
+    # llama.cpp / local inference server with lazy model loading
+    # (``--no-model-autoload``) returns 400 "model is not loaded" while the
+    # requested model is being loaded into memory.  The model exists and
+    # will become available shortly — the correct recovery is to wait (retry
+    # with backoff), NOT to abort as a format error or fall back to a
+    # different model.  Must be checked BEFORE the generic large-session
+    # context-overflow heuristic below, otherwise a large session mid-load
+    # is misrouted into context compression (silently deleting history)
+    # instead of simply waiting for the load to finish.
+    if any(p in error_msg for p in _MODEL_NOT_LOADED_PATTERNS):
+        return result_fn(
+            FailoverReason.model_not_loaded,
+            retryable=True,
+            should_fallback=False,
+            should_compress=False,
+        )
+
     # Context overflow from 400
     if any(p in error_msg for p in _CONTEXT_OVERFLOW_PATTERNS):
         return result_fn(
@@ -1603,6 +1636,18 @@ def _classify_by_message(
             FailoverReason.provider_policy_blocked,
             retryable=False,
             should_fallback=False,
+        )
+
+    # Model not loaded (lazy-loading local server) — checked before
+    # model_not_found so a mid-load model isn't mislabelled as missing
+    # (which would be non-retryable + fallback). It exists and will be
+    # ready shortly; wait for it.
+    if any(p in error_msg for p in _MODEL_NOT_LOADED_PATTERNS):
+        return result_fn(
+            FailoverReason.model_not_loaded,
+            retryable=True,
+            should_fallback=False,
+            should_compress=False,
         )
 
     # Model not found patterns
