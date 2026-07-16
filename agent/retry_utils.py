@@ -74,6 +74,36 @@ def jittered_backoff(
     return delay + jitter
 
 
+def error_retry_backoff(attempt: int, reason: "Any") -> float:
+    """Backoff wait for a retryable, non-rate-limit API error.
+
+    Most retryable errors use the standard jittered exponential schedule
+    (2s base, 60s cap). The exception is lazy model loading
+    (:pyattr:`FailoverReason.model_not_loaded`, e.g. a llama.cpp server
+    started with ``--no-model-autoload``): the requested model is being
+    loaded into memory and will be ready shortly, so the wait saturates at
+    30s instead of letting the default schedule climb to 60s+ (which, with
+    jitter, leaves an already-loaded model sitting idle through attempts 6+).
+
+    The base still grows (2, 4, 8, 16, 30, 30...) for early decorrelation
+    before saturating; the final value is clamped so jitter never pushes it
+    above the cap.
+
+    Args:
+        attempt: 1-based retry attempt number.
+        reason: The classified ``FailoverReason`` for the error.
+
+    Returns:
+        Wait in seconds. Guaranteed ``<= 30.0`` for ``model_not_loaded``;
+        ``<= 90.0`` (60s cap + jitter) otherwise.
+    """
+    from agent.error_classifier import FailoverReason
+
+    if reason == FailoverReason.model_not_loaded:
+        return min(jittered_backoff(attempt, base_delay=2.0, max_delay=30.0), 30.0)
+    return jittered_backoff(attempt, base_delay=2.0, max_delay=60.0)
+
+
 def _error_text(error: Any) -> str:
     """Best-effort flattened provider error text for retry classification."""
     parts = [

@@ -78,6 +78,7 @@ from agent.prompt_caching import (
 )
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
+    error_retry_backoff,
     is_zai_coding_overload_error,
     jittered_backoff,
     zai_coding_overload_retry_ceiling,
@@ -5283,8 +5284,16 @@ def run_conversation(
                                 _retry_after = min(float(_ra_raw), 600)
                             except (TypeError, ValueError):
                                 pass
-                wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                 _backoff_policy = None
+                if _retry_after:
+                    wait_time = _retry_after
+                else:
+                    # Non-rate-limit retryable errors (transient transport
+                    # blips, llama.cpp "model is not loaded" mid-load, etc.).
+                    # ``error_retry_backoff`` caps lazy-model-load waits at
+                    # 30s so an already-loaded model isn't left idle; other
+                    # reasons use the standard 60s cap.
+                    wait_time = error_retry_backoff(retry_count, classified.reason)
                 if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(
                         retry_count,

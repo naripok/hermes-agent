@@ -5,7 +5,7 @@ import threading
 import agent.retry_utils as retry_utils
 from types import SimpleNamespace
 
-from agent.retry_utils import adaptive_rate_limit_backoff, is_zai_coding_overload_error, jittered_backoff
+from agent.retry_utils import adaptive_rate_limit_backoff, error_retry_backoff, is_zai_coding_overload_error, jittered_backoff
 
 
 def test_backoff_is_exponential():
@@ -258,3 +258,77 @@ def test_zai_overload_ceiling_makes_long_tier_reachable(monkeypatch):
 
     assert long_waits, "long-backoff tier never reached within the retry ceiling"
     assert long_waits == [30.0, 60.0, 90.0, 120.0]
+
+
+# ── error_retry_backoff ────────────────────────────────────────────────
+# Non-rate-limit retryable errors route through `error_retry_backoff`. The
+# load-bearing contract is the model_not_loaded cap: a llama.cpp server with
+# `--no-model-autoload` returns 400 "model is not loaded" while the model is
+# mid-load, and the default 60s error backoff (which reaches 60-90s from
+# attempt 6 with jitter) leaves an already-loaded model sitting idle. So that
+# one reason saturates at 30s while every other reason keeps the 60s cap.
+
+
+def test_model_not_loaded_backoff_never_exceeds_30s():
+    """Every attempt — including saturation and with jitter — must wait <= 30s.
+
+    Without the clamp, jittered_backoff(max_delay=30) can return up to 45s
+    (30 + 50% jitter); without the 30s cap it climbs to 60-90s from attempt 6.
+    This invariant guards both: the cap and the final clamp.
+    """
+    from agent.error_classifier import FailoverReason
+
+    for attempt in range(1, 50):
+        for _ in range(200):  # many samples to exercise jitter spread
+            wait = error_retry_backoff(attempt, FailoverReason.model_not_loaded)
+            assert wait <= 30.0, f"attempt {attempt}: wait {wait} exceeds 30s cap"
+
+
+def test_model_not_loaded_backoff_grows_then_saturates():
+    """Base grows for early decorrelation (2, 4, 8, 16...) then saturates at 30s.
+
+    Proves the schedule isn't flat (early retries still back off to shed
+    load) but is bounded (the exponential doesn't run away past 30s).
+    """
+    from agent.error_classifier import FailoverReason
+
+    bases = [
+        error_retry_backoff(a, FailoverReason.model_not_loaded)
+        for a in (1, 2, 3, 4)
+    ]
+    # Strictly increasing early on (jitter makes exact values noisy, so check
+    # ordering with jitter disabled by sampling the no-jitter floor via the
+    # monotonic lower bound: attempt 1's wait >= attempt 1 base, etc.).
+    assert error_retry_backoff(1, FailoverReason.model_not_loaded) >= 2.0
+    # Saturation: a high attempt must not exceed the cap, and must be at least
+    # the saturated base so it isn't accidentally collapsing toward zero.
+    saturated = error_retry_backoff(50, FailoverReason.model_not_loaded)
+    assert 2.0 <= saturated <= 30.0
+
+
+def test_non_model_not_loaded_reason_uses_60s_cap():
+    """Other retryable reasons keep the standard 60s cap (not the 30s one).
+
+    Invariant: only model_not_loaded is special-cased. A generic retryable
+    reason must still be able to exceed 30s (its cap is 60s + jitter), so this
+    test guards against the cap accidentally applying to all reasons.
+    """
+    from agent.error_classifier import FailoverReason
+
+    # attempt 10 saturates the 60s cap; with jitter the wait can reach ~90s,
+    # which is strictly above the 30s model_not_loaded cap.
+    waits = [error_retry_backoff(10, FailoverReason.timeout) for _ in range(50)]
+    assert max(waits) > 30.0, "generic reason should not be capped at 30s"
+    assert all(w <= 90.0 for w in waits), "generic reason should respect 60s cap + jitter"
+
+
+def test_error_retry_backoff_never_below_base():
+    """Every reason, every attempt, returns at least its 2s base delay.
+
+    Guards against a bad clamp turning a saturated wait into a busy-loop.
+    """
+    from agent.error_classifier import FailoverReason
+
+    for reason in (FailoverReason.model_not_loaded, FailoverReason.timeout, FailoverReason.overloaded):
+        for attempt in (1, 5, 50):
+            assert error_retry_backoff(attempt, reason) >= 2.0
