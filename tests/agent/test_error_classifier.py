@@ -58,6 +58,7 @@ class TestFailoverReason:
             "ssl_cert_verification",
             "context_overflow", "payload_too_large", "image_too_large",
             "model_not_found", "format_error",
+            "model_not_loaded",
             "invalid_encrypted_content",
             "multimodal_tool_content_unsupported",
             "provider_policy_blocked",
@@ -921,6 +922,67 @@ class TestClassifyApiError:
         e = MockAPIError("error parsing grammar", status_code=500)
         result = classify_api_error(e, provider="openai-compatible")
         assert result.reason != FailoverReason.llama_cpp_grammar_pattern
+
+    # ── llama.cpp / local server: model not loaded (lazy loading) ──
+
+    def test_400_model_not_loaded_is_retryable(self):
+        """llama.cpp --no-model-autoload returns 400 while a model loads.
+
+        The model exists and will become available once the server finishes
+        loading it into memory, so the agent must wait (retry with backoff)
+        instead of aborting the turn as a non-retryable client error.
+        Reproduces the real error shape from a llama.cpp OAI server.
+        """
+        e = MockAPIError(
+            "HTTP 400: model is not loaded",
+            status_code=400,
+            body={
+                "error": {
+                    "code": 400,
+                    "message": "model is not loaded",
+                    "type": "invalid_request_error",
+                }
+            },
+        )
+        result = classify_api_error(e, provider="custom", model="qwen3.6-27b")
+        assert result.reason == FailoverReason.model_not_loaded
+        assert result.retryable is True
+        assert result.should_fallback is False
+        assert result.should_compress is False
+
+    def test_400_model_not_loaded_not_treated_as_context_overflow(self):
+        """A large session mid-load must not be misrouted to compression.
+
+        Guards against the generic-400-large-session heuristic catching a
+        model-not-loaded error on a big conversation and silently deleting
+        history via context compression while the real fix is just to wait.
+        """
+        e = MockAPIError("model is not loaded", status_code=400)
+        result = classify_api_error(
+            e,
+            provider="custom",
+            model="qwen3.6-27b",
+            approx_tokens=150_000,
+            context_length=200_000,
+            num_messages=250,
+        )
+        assert result.reason == FailoverReason.model_not_loaded
+        assert result.retryable is True
+        assert result.should_compress is False
+
+    def test_message_only_model_not_loaded_is_retryable_not_missing(self):
+        """A status-less 'model is not loaded' must wait, not be 'not found'.
+
+        Some local-server shims surface the error without an HTTP status
+        attribute. It must not fall into the non-retryable model_not_found
+        bucket (which would trigger an unwanted model fallback); it should
+        classify as a retryable model_not_loaded so the agent waits.
+        """
+        e = Exception("model is not loaded")
+        result = classify_api_error(e, provider="custom")
+        assert result.reason == FailoverReason.model_not_loaded
+        assert result.retryable is True
+        assert result.should_fallback is False
 
     # ── Provider-specific: Anthropic long-context tier ──
 
