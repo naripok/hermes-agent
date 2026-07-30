@@ -15732,7 +15732,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             _bg_procs = None
 
-        decision = mgr.evaluate_after_turn(
+        # evaluate_after_turn → judge_goal → call_llm issues a synchronous
+        # OpenAI/httpx request. Running it inline blocks the gateway's event
+        # loop for the whole judge timeout (default 30s, longer when
+        # ``auxiliary.goal_judge.timeout`` is raised for a slow judge). Offload
+        # it to a worker thread so the loop keeps servicing message delivery,
+        # pending-message guards, and platform I/O while the judge runs.
+        decision = await asyncio.to_thread(
+            mgr.evaluate_after_turn,
             final_response or "",
             user_initiated=True,
             background_processes=_bg_procs,
