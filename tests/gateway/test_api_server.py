@@ -13,6 +13,7 @@ Tests cover:
 """
 
 import asyncio
+import base64
 import json
 import os
 import stat
@@ -3171,6 +3172,14 @@ class TestResponsesEndpoint:
             assert resp.status == 400
 
 
+# 1x1 transparent PNG (same fixture bytes as
+# tests/gateway/test_api_server_media_data_urls.py).
+_PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQAB"
+    "h6FO1AAAAABJRU5ErkJggg=="
+)
+
+
 class TestResponsesStreaming:
     @pytest.mark.asyncio
     async def test_stream_true_returns_responses_sse(self, adapter):
@@ -3202,6 +3211,78 @@ class TestResponsesStreaming:
                 assert '"logprobs": []' in body
                 assert "Hello" in body
                 assert " world" in body
+
+    @pytest.mark.asyncio
+    async def test_stream_resolves_media_tags_in_terminal_events(self, adapter, tmp_path):
+        """Streaming Responses API must resolve MEDIA:<path> image tags.
+
+        Remote frontends (Open WebUI) consume the Responses stream: they
+        accumulate ``response.output_text.delta`` text live, then REPLACE
+        the message with the terminal ``response.output_text.done`` text
+        and the ``response.completed`` output.  The non-streaming handlers
+        inline ``MEDIA:`` image tags as base64 data-URL markdown via
+        ``_resolve_media_to_data_urls``; the streaming terminal events must
+        carry the same resolved text or the raw tag is what the UI keeps.
+
+        The stored conversation history must keep the RAW tag — it is the
+        model's own delivery protocol, and inlining multi-MB base64 into
+        the transcript would bloat every subsequent turn's LLM context.
+        """
+        png = tmp_path / "shot.png"
+        png.write_bytes(_PNG_BYTES)
+        agent_text = f"Here is the image: MEDIA:{png}"
+
+        def _sse_events(body: str):
+            events = {}
+            for block in body.split("\n\n"):
+                lines = block.strip().splitlines()
+                if not lines or not lines[0].startswith("event: "):
+                    continue
+                events.setdefault(lines[0][7:], []).append(
+                    json.loads(lines[1][6:]) if len(lines) > 1 and lines[1].startswith("data: ") else {}
+                )
+            return events
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb("Here is the image: ")
+                    cb(f"MEDIA:{png}")
+                return (
+                    {"final_response": agent_text, "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "hi", "stream": True},
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        events = _sse_events(body)
+
+        # Terminal output_text.done carries the resolved image markdown.
+        done_text = events["response.output_text.done"][0]["text"]
+        assert "data:image/png;base64," in done_text
+        assert "MEDIA:" not in done_text
+
+        # The message output_item.done and response.completed payloads match.
+        msg_done = events["response.output_item.done"][0]["item"]
+        assert "data:image/png;base64," in msg_done["content"][0]["text"]
+        completed = events["response.completed"][0]["response"]
+        msg_items = [i for i in completed["output"] if i.get("type") == "message"]
+        assert "data:image/png;base64," in msg_items[-1]["content"][0]["text"]
+        assert "MEDIA:" not in msg_items[-1]["content"][0]["text"]
+
+        # Stored transcript keeps the raw tag (no base64 in LLM context).
+        response_id = completed["id"]
+        stored = adapter._response_store.get(response_id)
+        history_text = json.dumps(stored["conversation_history"])
+        assert "data:image/png;base64," not in history_text
 
     @pytest.mark.asyncio
     async def test_stream_string_false_returns_json_response(self, adapter):

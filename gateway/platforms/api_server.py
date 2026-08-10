@@ -4679,13 +4679,22 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Close the message item if it was opened
             final_response_text = "".join(final_text_parts) or final_response_text
+            # Resolve MEDIA:<path> image tags to inline data URLs for the
+            # client-facing terminal events, same as the non-streaming
+            # handlers.  Responses-API frontends (Open WebUI) render the
+            # deltas live but REPLACE the message with the terminal
+            # output_text.done / response.completed text, so the resolved
+            # text is what persists in the UI.  The stored transcript keeps
+            # the raw tag: it is the model's own delivery protocol, and
+            # inlining base64 into history would bloat later turns' context.
+            final_display_text = _resolve_media_to_data_urls(final_response_text)
             if message_opened:
                 await _write_event("response.output_text.done", {
                     "type": "response.output_text.done",
                     "item_id": message_item_id,
                     "output_index": message_output_index,
                     "content_index": 0,
-                    "text": final_response_text,
+                    "text": final_display_text,
                     "logprobs": [],
                 })
                 msg_done_item = {
@@ -4694,7 +4703,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "status": "completed",
                     "role": "assistant",
                     "content": [
-                        {"type": "output_text", "text": final_response_text}
+                        {"type": "output_text", "text": final_display_text}
                     ],
                 }
                 await _write_event("response.output_item.done", {
@@ -4737,7 +4746,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "type": "message",
                 "role": "assistant",
                 "content": [
-                    {"type": "output_text", "text": final_response_text or (_redact_api_error_text(agent_error) if agent_error else "")}
+                    {"type": "output_text", "text": final_display_text or (_redact_api_error_text(agent_error) if agent_error else "")}
                 ],
             })
 
