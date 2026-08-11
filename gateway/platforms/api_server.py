@@ -83,6 +83,7 @@ except ImportError:
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
+    IMAGE_CACHE_DIR,
     MEDIA_TAG_CLEANUP_RE,
     BasePlatformAdapter,
     SendResult,
@@ -399,6 +400,24 @@ def _auto_truncate_response_history(
     return [conversation_history[index] for index in sorted(kept_indices)]
 
 
+def _bounded_normalized_text(value: Any) -> str:
+    """Bounded text for the model context: strip inline base64 image blobs,
+    then truncate.
+
+    Data URLs arrive in context when a frontend re-sends earlier assistant
+    messages verbatim (the display text carries bounded data URLs after
+    ``_prepare_display_text``).  The pixels are unreadable noise to the LLM
+    and only inflate the prompt, so a short marker replaces them before the
+    standard length cap applies.
+    """
+    try:
+        text = str(value)
+    except Exception:
+        return ""
+    text = _EMBEDDED_DATA_URL_RE.sub("[base64 image]", text)
+    return text[:MAX_NORMALIZED_TEXT_LENGTH] if len(text) > MAX_NORMALIZED_TEXT_LENGTH else text
+
+
 def _normalize_chat_content(
     content: Any, *, _max_depth: int = 10, _depth: int = 0,
 ) -> str:
@@ -420,7 +439,7 @@ def _normalize_chat_content(
     if content is None:
         return ""
     if isinstance(content, str):
-        return content[:MAX_NORMALIZED_TEXT_LENGTH] if len(content) > MAX_NORMALIZED_TEXT_LENGTH else content
+        return _bounded_normalized_text(content)
 
     if isinstance(content, list):
         parts: List[str] = []
@@ -429,7 +448,7 @@ def _normalize_chat_content(
         for item in items:
             if isinstance(item, str):
                 if item:
-                    part = item[:MAX_NORMALIZED_TEXT_LENGTH]
+                    part = _bounded_normalized_text(item)
                     parts.append(part)
                     total_len += len(part)
             elif isinstance(item, dict):
@@ -438,7 +457,7 @@ def _normalize_chat_content(
                     text = item.get("text", "")
                     if text:
                         try:
-                            part = str(text)[:MAX_NORMALIZED_TEXT_LENGTH]
+                            part = _bounded_normalized_text(text)
                             parts.append(part)
                             total_len += len(part)
                         except Exception:
@@ -453,12 +472,12 @@ def _normalize_chat_content(
             if total_len >= MAX_NORMALIZED_TEXT_LENGTH:
                 break
         result = "\n".join(parts)
-        return result[:MAX_NORMALIZED_TEXT_LENGTH] if len(result) > MAX_NORMALIZED_TEXT_LENGTH else result
+        return _bounded_normalized_text(result)
 
     # Fallback for unexpected types (int, float, bool, etc.)
     try:
         result = str(content)
-        return result[:MAX_NORMALIZED_TEXT_LENGTH] if len(result) > MAX_NORMALIZED_TEXT_LENGTH else result
+        return _bounded_normalized_text(result)
     except Exception:
         return ""
 
@@ -493,7 +512,7 @@ def _normalize_multimodal_content(content: Any) -> Any:
     if content is None:
         return ""
     if isinstance(content, str):
-        return content[:MAX_NORMALIZED_TEXT_LENGTH] if len(content) > MAX_NORMALIZED_TEXT_LENGTH else content
+        return _bounded_normalized_text(content)
     if not isinstance(content, list):
         # Mirror the legacy text-normalizer's fallback so callers that
         # pre-existed image support still get a string back.
@@ -506,7 +525,7 @@ def _normalize_multimodal_content(content: Any) -> Any:
     for part in items:
         if isinstance(part, str):
             if part:
-                trimmed = part[:MAX_NORMALIZED_TEXT_LENGTH]
+                trimmed = _bounded_normalized_text(part)
                 normalized_parts.append({"type": "text", "text": trimmed})
                 text_accum_len += len(trimmed)
             continue
@@ -527,7 +546,7 @@ def _normalize_multimodal_content(content: Any) -> Any:
             if not isinstance(text, str):
                 text = str(text)
             if text:
-                trimmed = text[:MAX_NORMALIZED_TEXT_LENGTH]
+                trimmed = _bounded_normalized_text(text)
                 normalized_parts.append({"type": "text", "text": trimmed})
                 text_accum_len += len(trimmed)
             continue
@@ -848,7 +867,115 @@ _MEDIA_MIME = {
     ".webp": "image/webp",
     ".bmp": "image/bmp",
 }
-_MEDIA_DATA_URL_MAX_BYTES = 5 * 1024 * 1024  # skip images larger than 5MB
+# ── Inline image size bounds ──────────────────────────────────────────────
+# Remote frontends (Open WebUI) relay SSE one line at a time, re-render the
+# stored assistant text, and re-send later turns' history back to the API
+# server, so every hop has a hard size ceiling (aiohttp line reader, socket
+# payloads, DB rows, and the request-body cap).  Fine originals are inlined
+# byte-for-byte; anything larger is re-encoded to a bounded display-size
+# image instead of inlining multi-MB base64 that trips those limits.
+_MEDIA_INLINE_ORIGINAL_MAX_BYTES = 256 * 1024  # inline source as-is below this
+_MEDIA_INLINE_SOURCE_MAX_BYTES = 50 * 1024 * 1024  # don't even read beyond this
+_MEDIA_INLINE_MAX_EDGE = 1024  # long edge after downscale
+_MEDIA_INLINE_FALLBACK_EDGE = 512  # one retry at half edge if still oversized
+_MEDIA_INLINE_MAX_BYTES = 200 * 1024  # target encoded size for re-encodes
+_MEDIA_INLINE_TOTAL_BUDGET_BYTES = 1500 * 1024  # cumulative per-message cap
+# Embedded data-URL blobs (the model occasionally emits raw base64 instead of
+# a MEDIA: tag): capture blobs in this size window to a media-cache file and
+# rewrite them as MEDIA: tags so the same bounded inlining applies.
+_MEDIA_CAPTURE_MIN_BYTES = 4 * 1024
+_MEDIA_CAPTURE_MAX_BYTES = 20 * 1024 * 1024
+_MEDIA_CAPTURE_MAX_COUNT = 20
+
+_EMBEDDED_DATA_URL_RE = re.compile(
+    r"data:image/(png|jpe?g|gif|webp|bmp);base64,([A-Za-z0-9+/=]+)",
+    re.IGNORECASE,
+)
+
+
+def _reencode_image_for_inline(data: bytes) -> Optional[tuple[bytes, str]]:
+    """Re-encode image bytes to a bounded display-size JPEG/PNG.
+
+    Returns ``(encoded_bytes, mime)`` or None when the bytes cannot be
+    decoded.  Static images are downscaled to at most
+    ``_MEDIA_INLINE_MAX_EDGE`` and re-encoded (JPEG without alpha, PNG with
+    alpha); if the result still exceeds ``_MEDIA_INLINE_MAX_BYTES`` the long
+    edge is halved once and the encode is retried.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    import io as _io
+
+    try:
+        img = Image.open(_io.BytesIO(data))
+        img.load()
+    except Exception:
+        return None
+    try:
+        for edge in (_MEDIA_INLINE_MAX_EDGE, _MEDIA_INLINE_FALLBACK_EDGE):
+            work = img.copy()
+            work.thumbnail((edge, edge))
+            out = _io.BytesIO()
+            if "A" in work.getbands():
+                work.save(out, "PNG")
+                mime = "image/png"
+            else:
+                work.convert("RGB").save(out, "JPEG", quality=82)
+                mime = "image/jpeg"
+            encoded = out.getvalue()
+            if len(encoded) <= _MEDIA_INLINE_MAX_BYTES or edge == _MEDIA_INLINE_FALLBACK_EDGE:
+                return encoded, mime
+    except Exception:
+        return None
+    return None
+
+
+def _capture_embedded_data_urls(text: str) -> str:
+    """Rewrite model-embedded base64 image data URLs as MEDIA: cache tags.
+
+    The model occasionally emits ``![alt](data:image/...;base64,<blob>)``
+    directly instead of ``MEDIA:<path>``.  Those blobs can be multi-MB — far
+    past every downstream limit (frontend SSE line, socket payload, request
+    cap) — so they are written to a media-cache file and the inline blob is
+    replaced with the standard ``MEDIA:`` tag, letting the normal bounded
+    inlining pipeline handle delivery.
+    """
+    if not text or "data:image/" not in text:
+        return text
+    import base64
+
+    captured = 0
+    try:
+        IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return text
+
+    def _repl(m: "re.Match[str]") -> str:
+        nonlocal captured
+        if captured >= _MEDIA_CAPTURE_MAX_COUNT:
+            return m.group(0)
+        blob = m.group(2)
+        if len(blob) < _MEDIA_CAPTURE_MIN_BYTES or len(blob) > _MEDIA_CAPTURE_MAX_BYTES:
+            return m.group(0)
+        try:
+            data = base64.b64decode(blob)
+        except Exception:
+            return m.group(0)
+        ext = ".png" if m.group(1).lower() == "png" else ".jpg"
+        path = IMAGE_CACHE_DIR / f"embedded_{uuid.uuid4().hex[:16]}{ext}"
+        try:
+            path.write_bytes(data)
+        except OSError:
+            return m.group(0)
+        captured += 1
+        return f"MEDIA:{path}"
+
+    try:
+        return _EMBEDDED_DATA_URL_RE.sub(_repl, text)
+    except Exception:
+        return text
 
 
 def _resolve_media_to_data_urls(text: str) -> str:
@@ -857,7 +984,9 @@ def _resolve_media_to_data_urls(text: str) -> str:
     Remote OpenAI-compatible frontends can't read local file paths, so
     ``MEDIA:`` tags referencing images on the server are useless to them.
     Inline small local images as markdown data URLs; non-image or unreadable
-    paths are left untouched.
+    paths are left untouched.  Large images are re-encoded to a bounded
+    display size (``_reencode_image_for_inline``) so the resulting message
+    text stays within every downstream consumer's size limits.
 
     Uses the same anchored ``MEDIA_TAG_CLEANUP_RE`` matcher and
     ``validate_media_delivery_path`` safety check every other platform
@@ -874,7 +1003,10 @@ def _resolve_media_to_data_urls(text: str) -> str:
         return text
     import base64
 
+    budget_remaining = _MEDIA_INLINE_TOTAL_BUDGET_BYTES
+
     def _to_data_url(path_str: str) -> Optional[str]:
+        nonlocal budget_remaining
         # validate_media_delivery_path() strips wrapping quotes/backticks
         # and trailing punctuation internally, same as MEDIA_TAG_CLEANUP_RE's
         # other callers (extract_media / _strip_media_tag_directives) rely on.
@@ -886,12 +1018,23 @@ def _resolve_media_to_data_urls(text: str) -> str:
         if suffix not in _MEDIA_IMG_EXT:
             return None
         try:
-            if p.stat().st_size > _MEDIA_DATA_URL_MAX_BYTES:
+            if p.stat().st_size > _MEDIA_INLINE_SOURCE_MAX_BYTES:
                 return None
-            b64 = base64.b64encode(p.read_bytes()).decode()
+            data = p.read_bytes()
         except OSError:
             return None
-        return f"![image](data:{_MEDIA_MIME[suffix]};base64,{b64})"
+        if len(data) > _MEDIA_INLINE_ORIGINAL_MAX_BYTES:
+            reencoded = _reencode_image_for_inline(data)
+            if reencoded is None:
+                return None  # leave the MEDIA: tag as literal text
+            data, mime = reencoded
+        else:
+            mime = _MEDIA_MIME[suffix]
+        b64 = base64.b64encode(data).decode()
+        if len(b64) > budget_remaining:
+            return None  # per-message budget exhausted — stop inlining
+        budget_remaining -= len(b64)
+        return f"![image](data:{mime};base64,{b64})"
 
     def _repl(m: "re.Match[str]") -> str:
         return _to_data_url(m.group("path")) or m.group(0)
@@ -900,6 +1043,15 @@ def _resolve_media_to_data_urls(text: str) -> str:
         return MEDIA_TAG_CLEANUP_RE.sub(_repl, text)
     except Exception:
         return text
+
+
+def _prepare_display_text(text: str) -> str:
+    """Turn raw assistant text into client-displayable markdown.
+
+    1. Rewrite model-embedded base64 image blobs as ``MEDIA:`` tags.
+    2. Inline ``MEDIA:`` tags as bounded base64 data URLs.
+    """
+    return _resolve_media_to_data_urls(_capture_embedded_data_urls(text))
 
 
 def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
@@ -3407,7 +3559,7 @@ class APIServerAdapter(BasePlatformAdapter):
             **agent_overrides,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
-        final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+        final_response = _prepare_display_text(result.get("final_response", "") if isinstance(result, dict) else "")
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
@@ -3571,7 +3723,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     confirmed_runtime_lock=lock_active,
                     **agent_overrides,
                 )
-                final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+                final_response = _prepare_display_text(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
                 effective_runtime = {}
@@ -3977,7 +4129,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
+        final_response = _prepare_display_text(result.get("final_response") or "")
         is_partial = bool(result.get("partial"))
         is_failed = bool(result.get("failed"))
         completed = bool(result.get("completed", True))
@@ -4609,7 +4761,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 # can start a fresh timer while we emit
                 nonlocal _batch_buf, _batch_timer
                 _batch_timer = None
-                await _flush_batch()
+                try:
+                    await _flush_batch()
+                except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+                    # Client disconnected while this background task waited.
+                    # The main loop's write path already handles interrupt /
+                    # cancel once it observes the dead transport; swallow here
+                    # so the abandoned task doesn't surface a spurious
+                    # "Task exception was never retrieved".
+                    return
 
             async def _flush_batch() -> None:
                 """Emit a single SSE delta for all accumulated text."""
@@ -4687,7 +4847,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # text is what persists in the UI.  The stored transcript keeps
             # the raw tag: it is the model's own delivery protocol, and
             # inlining base64 into history would bloat later turns' context.
-            final_display_text = _resolve_media_to_data_urls(final_response_text)
+            final_display_text = _prepare_display_text(final_response_text)
             if message_opened:
                 await _write_event("response.output_text.done", {
                     "type": "response.output_text.done",
@@ -5117,7 +5277,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = _resolve_media_to_data_urls(result.get("final_response", ""))
+        final_response = _prepare_display_text(result.get("final_response", ""))
         if not final_response:
             final_response = _redact_api_error_text(result.get("error", "(No response generated)"))
 

@@ -2,16 +2,22 @@
 
 Remote OpenAI-compatible frontends can't read local file paths, so
 ``MEDIA:<path>`` image tags in final responses are inlined as markdown
-data URLs before crossing the HTTP boundary.
+data URLs before crossing the HTTP boundary.  Images larger than a
+display-size budget are re-encoded instead of inlined raw, because every
+downstream hop (frontend SSE line reader, socket payloads, DB rows,
+request-body cap) has a hard size ceiling — multi-MB base64 in the
+message text surfaced as 400/413 errors and silently dropped SSE events.
 """
 
 import base64
+import io
 import unittest
 
 import pytest
 
 pytest.importorskip("aiohttp")
 
+from gateway.platforms import api_server as mod
 from gateway.platforms.api_server import _resolve_media_to_data_urls  # noqa: E402
 
 # 1x1 transparent PNG
@@ -21,15 +27,30 @@ _PNG_BYTES = base64.b64decode(
 )
 
 
+def _noise_png(edge: int = 1400) -> bytes:
+    """A large incompressible RGB PNG (>256 KiB) for re-encode tests."""
+    import os
+
+    from PIL import Image
+
+    img = Image.frombytes("RGB", (edge, edge), os.urandom(edge * edge * 3))
+    out = io.BytesIO()
+    img.save(out, "PNG")
+    return out.getvalue()
+
+
 class TestResolveMediaToDataUrls(unittest.TestCase):
-    def _write_png(self, tmpdir_name="hermes_media_test"):
+    def _write_bytes(self, data: bytes, name: str = "shot.png", prefix: str = "hermes_media_test"):
         import tempfile
         from pathlib import Path
 
-        d = Path(tempfile.mkdtemp(prefix=tmpdir_name))
-        p = d / "shot.png"
-        p.write_bytes(_PNG_BYTES)
+        d = Path(tempfile.mkdtemp(prefix=prefix))
+        p = d / name
+        p.write_bytes(data)
         return p
+
+    def _write_png(self, tmpdir_name="hermes_media_test"):
+        return self._write_bytes(_PNG_BYTES, prefix=tmpdir_name)
 
     def test_media_tag_inlined(self):
         p = self._write_png()
@@ -54,17 +75,48 @@ class TestResolveMediaToDataUrls(unittest.TestCase):
         self.assertEqual(_resolve_media_to_data_urls("plain text"), "plain text")
         self.assertEqual(_resolve_media_to_data_urls(""), "")
 
-    def test_oversized_image_skipped(self):
-        from gateway.platforms import api_server as mod
-
+    def test_small_image_inlined_byte_for_byte(self):
+        # The 1x1 PNG is under the original-inline threshold — its exact
+        # bytes (and thus exact data URL) must be preserved.
         p = self._write_png()
-        orig = mod._MEDIA_DATA_URL_MAX_BYTES
-        mod._MEDIA_DATA_URL_MAX_BYTES = 1
+        expected = b"data:image/png;base64," + base64.b64encode(_PNG_BYTES)
+        self.assertIn(expected.decode(), _resolve_media_to_data_urls(f"MEDIA:{p}"))
+
+    def test_large_image_reencoded_bounded(self):
+        """Oversized images are re-encoded to a display-size JPEG instead of
+        inlining megabytes of raw base64 — this is what keeps every
+        downstream consumer (aiohttp line reader, socket, request cap)
+        inside its limits for real image turns."""
+        from PIL import Image
+
+        p = self._write_bytes(_noise_png())
+        raw = p.read_bytes()
+        raw_b64_len = (len(raw) * 4) // 3
+        out = _resolve_media_to_data_urls(f"MEDIA:{p}")
+        self.assertIn("data:image/jpeg;base64,", out)
+        data_url = out.split("data:image/jpeg;base64,")[1].split(")")[0]
+        self.assertLess(len(data_url), raw_b64_len)
+        decoded = base64.b64decode(data_url)
+        img = Image.open(io.BytesIO(decoded))
+        self.assertLessEqual(max(img.size), mod._MEDIA_INLINE_MAX_EDGE)
+
+    def test_undecodable_image_left_untouched(self):
+        """A path with an image suffix but undecodable bytes must not be
+        inlined (would emit a broken image) — the MEDIA: tag stays literal."""
+        # Oversized so the re-encode path runs (small files pass through
+        # byte-for-byte regardless of content).
+        p = self._write_bytes(b"not an image " * (24 * 1024))
+        text = f"MEDIA:{p}"
+        self.assertEqual(_resolve_media_to_data_urls(text), text)
+
+    def test_per_message_budget_exhausted_leaves_tag(self):
+        orig = mod._MEDIA_INLINE_TOTAL_BUDGET_BYTES
+        mod._MEDIA_INLINE_TOTAL_BUDGET_BYTES = 1
         try:
-            text = f"MEDIA:{p}"
-            self.assertEqual(_resolve_media_to_data_urls(text), text)
+            p = self._write_png()
+            self.assertEqual(_resolve_media_to_data_urls(f"MEDIA:{p}"), f"MEDIA:{p}")
         finally:
-            mod._MEDIA_DATA_URL_MAX_BYTES = orig
+            mod._MEDIA_INLINE_TOTAL_BUDGET_BYTES = orig
 
     def test_multiple_tags(self):
         p1 = self._write_png()
@@ -105,6 +157,88 @@ class TestResolveMediaToDataUrls(unittest.TestCase):
             self.skipTest("symlink creation not supported in this environment")
         text = f"MEDIA:{link}"
         self.assertEqual(_resolve_media_to_data_urls(text), text)
+
+
+class TestCaptureEmbeddedDataUrls(unittest.TestCase):
+    """Model-embedded ``data:image`` blobs are captured to media-cache files
+    and rewritten as MEDIA: tags so the same bounded inline pipeline applies.
+    Without this, a turn where the model streams raw base64 into its reply
+    blows the same size limits the MEDIA: inlining exists to avoid."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        self._orig_dir = mod.IMAGE_CACHE_DIR
+        self._cache = Path(tempfile.mkdtemp(prefix="hermes_media_cache_test"))
+        mod.IMAGE_CACHE_DIR = self._cache
+
+    def tearDown(self):
+        mod.IMAGE_CACHE_DIR = self._orig_dir
+
+    def _blob(self, edge: int = 1400) -> bytes:
+        return _noise_png(edge)
+
+    def test_large_embedded_blob_become_media_tag_then_bounded_data_url(self):
+        from gateway.platforms.api_server import _capture_embedded_data_urls, _prepare_display_text
+
+        blob = self._blob()
+        big_b64 = base64.b64encode(blob).decode()
+        text = f"Here it is: ![Bedroom POV 1](data:image/png;base64,{big_b64})"
+        rewritten = _capture_embedded_data_urls(text)
+        self.assertIn("MEDIA:", rewritten)
+        self.assertNotIn("data:image", rewritten)
+        # The blob landed in the media cache with an image extension.
+        cached = [p for p in self._cache.iterdir() if p.suffix in (".png", ".jpg")]
+        self.assertEqual(len(cached), 1)
+        self.assertEqual(cached[0].read_bytes(), blob)
+        # Full display pipeline re-inlines it bounded.
+        out = _prepare_display_text(text)
+        self.assertIn("data:image/", out)
+        self.assertNotIn("MEDIA:", out)
+        data_url = out.split("data:image/")[1]
+        self.assertLess(len(data_url), len(big_b64))
+
+    def test_small_embedded_blob_left_inline(self):
+        from gateway.platforms.api_server import _capture_embedded_data_urls
+
+        small_b64 = base64.b64encode(_PNG_BYTES).decode()
+        text = f"![tiny](data:image/png;base64,{small_b64})"
+        self.assertEqual(_capture_embedded_data_urls(text), text)
+        self.assertEqual(list(self._cache.iterdir()), [])
+
+    def test_multiple_blobs_captured_with_budget_limit(self):
+        from gateway.platforms.api_server import _capture_embedded_data_urls
+
+        mod._MEDIA_CAPTURE_MAX_COUNT = 2
+        try:
+            text = " ".join(
+                f"![{i}](data:image/png;base64,{base64.b64encode(self._blob()).decode()})"
+                for i in range(3)
+            )
+            out = _capture_embedded_data_urls(text)
+            self.assertEqual(out.count("MEDIA:"), 2)
+            self.assertEqual(len(list(self._cache.iterdir())), 2)
+        finally:
+            mod._MEDIA_CAPTURE_MAX_COUNT = 20
+
+
+class TestBoundedNormalizedText(unittest.TestCase):
+    """Inline base64 image data is stripped from model-context text parts —
+    it is unreadable pixel noise to the LLM and only inflates the prompt —
+    before the standard 64 KB cap applies."""
+
+    def test_strips_data_url_and_truncates(self):
+        from gateway.platforms.api_server import _bounded_normalized_text
+
+        big_b64 = base64.b64encode(_noise_png(200)).decode()
+        text = f"previous message with ![img](data:image/png;base64,{big_b64}) end"
+        out = _bounded_normalized_text(text)
+        self.assertNotIn("data:image", out)
+        self.assertIn("[base64 image]", out)
+        # Truncation still applies to oversized text.
+        huge = "x" * 100_000
+        self.assertLessEqual(len(_bounded_normalized_text(huge)), mod.MAX_NORMALIZED_TEXT_LENGTH)
 
 
 if __name__ == "__main__":
